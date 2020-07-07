@@ -47,7 +47,7 @@ import java.util.Map;
  */
 public class SCIMCommonUtils {
 
-    private static Log log = LogFactory.getLog(SCIMCommonUtils.class);
+    private static final Log log = LogFactory.getLog(SCIMCommonUtils.class);
 
     /**
      * Since we need perform provisioning through UserOperationEventListener implementation -
@@ -67,11 +67,11 @@ public class SCIMCommonUtils {
     private static ThreadLocal<Boolean> threadLocalIsManagedThroughSCIMEP = new ThreadLocal<>();
 
     public static String getSCIMUserURL(String id) {
-        return getSCIMUserURL() + "/" + id;
+        return StringUtils.isNotBlank(id) ? getSCIMUserURL() + SCIMCommonConstants.URL_SEPERATOR + id : null;
     }
 
     public static String getSCIMGroupURL(String id) {
-        return getSCIMGroupURL() + "/" + id;
+        return StringUtils.isNotBlank(id) ? getSCIMGroupURL() + SCIMCommonConstants.URL_SEPERATOR + id : null;
     }
 
     public static String getSCIMServiceProviderConfigURL(String id){
@@ -81,15 +81,30 @@ public class SCIMCommonUtils {
     /*Handling ThreadLocals*/
 
     public static String getSCIMUserURL() {
-        String scimURL = IdentityUtil.getServerURL(SCIMCommonConstants.SCIM2_ENDPOINT, true, true);
-        String scimUserLocation = scimURL + SCIMCommonConstants.USERS;
-        return scimUserLocation;
+        String scimURL = getSCIMURL();
+        return scimURL + SCIMCommonConstants.USERS;
     }
 
     public static String getSCIMGroupURL() {
-        String scimURL = IdentityUtil.getServerURL(SCIMCommonConstants.SCIM2_ENDPOINT, true, true);
-        String scimGroupLocation = scimURL + SCIMCommonConstants.GROUPS;
-        return scimGroupLocation;
+        String scimURL = getSCIMURL();
+        return scimURL + SCIMCommonConstants.GROUPS;
+    }
+
+    private static String getSCIMURL() {
+        String scimURL;
+        String tenantDomain = PrivilegedCarbonContext.getThreadLocalCarbonContext().getTenantDomain();
+        if (isNotASuperTenantFlow(tenantDomain)) {
+            scimURL = IdentityUtil.getServerURL(
+                    SCIMCommonConstants.TENANT_URL_SEPERATOR + tenantDomain + SCIMCommonConstants.SCIM2_ENDPOINT, true,
+                    true);
+        } else {
+            scimURL = IdentityUtil.getServerURL(SCIMCommonConstants.SCIM2_ENDPOINT, true, true);
+        }
+        return scimURL;
+    }
+
+    private static boolean isNotASuperTenantFlow(String tenantDomain) {
+        return !MultitenantConstants.SUPER_TENANT_DOMAIN_NAME.equals(tenantDomain);
     }
 
     public static String getSCIMServiceProviderConfigURL() {
@@ -352,6 +367,22 @@ public class SCIMCommonUtils {
             return value;
         } else {
             return UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME + CarbonConstants.DOMAIN_SEPARATOR + value;
+        }
+    }
+
+    /**
+     * Method to extract domain name from the input value passed in to this method.
+     *
+     * @param nameWithDomain string which contains domain name
+     * @return extracted domain value or empty string if no domain.
+     */
+    public static String extractDomain(String nameWithDomain) {
+
+        if (nameWithDomain != null && nameWithDomain.indexOf(CarbonConstants.DOMAIN_SEPARATOR) > 0) {
+            String domain = nameWithDomain.substring(0, nameWithDomain.indexOf(CarbonConstants.DOMAIN_SEPARATOR));
+            return domain;
+        } else {
+            return null;
         }
     }
 }

@@ -80,6 +80,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 
 import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils.isFilterUsersAndGroupsOnlyFromPrimaryDomainEnabled;
 import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils.isFilteringEnhancementsEnabled;
@@ -93,7 +95,7 @@ public class SCIMUserManager implements UserManager {
     public static final String SQL_FILTERING_DELIMITER = "%";
     private static final String ERROR_CODE_INVALID_USERNAME = "31301";
     private static final String ERROR_CODE_INVALID_CREDENTIAL = "30003";
-    private static Log log = LogFactory.getLog(SCIMUserManager.class);
+    private static final Log log = LogFactory.getLog(SCIMUserManager.class);
     private UserStoreManager carbonUM = null;
     private ClaimManager carbonClaimManager = null;
     private static final int MAX_ITEM_LIMIT_UNLIMITED = -1;
@@ -649,18 +651,15 @@ public class SCIMUserManager implements UserManager {
                 requiredClaimsInLocalDialect = new ArrayList<>();
             }
 
+            // Get existing user claims.
             Map<String, String> oldClaimList = carbonUM.getUserClaimValues(user.getUserName(), requiredClaimsInLocalDialect
                     .toArray(new String[requiredClaimsInLocalDialect.size()]), null);
 
-            for (Map.Entry<String, String> entry : oldClaimList.entrySet()) {
-                if (!isImmutableClaim(entry.getKey())) {
-                    carbonUM.deleteUserClaimValue(user.getUserName(), entry.getKey(), null);
-                }
-            }
             // Get user claims mapped from SCIM dialect to WSO2 dialect.
             Map<String, String> claimValuesInLocalDialect = SCIMCommonUtils.convertSCIMtoLocalDialect(claims);
-            //set user claim values
-            carbonUM.setUserClaimValues(user.getUserName(), claimValuesInLocalDialect, null);
+
+            updateUserClaims(user, oldClaimList, claimValuesInLocalDialect);
+
             //if password is updated, set it separately
             if (user.getPassword() != null) {
                 carbonUM.updateCredentialByAdmin(user.getUserName(), user.getPassword());
@@ -1084,9 +1083,13 @@ public class SCIMUserManager implements UserManager {
                     offset));
         }
         try {
-            return ((PaginatedUserStoreManager) carbonUM)
+            String[] userNames =  ((PaginatedUserStoreManager) carbonUM)
                     .getUserList(condition, domainName, UserCoreConstants.DEFAULT_PROFILE, limit, offset, sortBy,
                             sortOrder);
+            
+            //prefix with domain name
+            return prefixWithDomain(userNames,domainName);
+
         } catch (UserStoreException e) {
             String errorMessage = String
                     .format("Error while retrieving users for the domain: %s with limit: %d and offset: %d.",
@@ -1370,7 +1373,7 @@ public class SCIMUserManager implements UserManager {
                 extensionClaims = carbonClaimManager.getAllClaimMappings(
                         SCIMUserSchemaExtensionBuilder.getInstance().getExtensionSchema().getURI());
             }
-            Map<String, String> attributes = new HashMap<>();
+            final Map<String, String> attributes = new HashMap<>();
             for (ClaimMapping claim : coreClaims) {
                 attributes.put(claim.getClaim().getClaimUri(), claim.getMappedAttribute(domainName));
             }
@@ -1382,6 +1385,25 @@ public class SCIMUserManager implements UserManager {
                     attributes.put(claim.getClaim().getClaimUri(), claim.getMappedAttribute(domainName));
                 }
             }
+            
+            //set default mapped attributes for secondaries user stores
+            if(domainName != UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME) {
+                Map<String, String> primaryAttributes = getAllAttributes(UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME);
+                primaryAttributes.forEach(
+                        new BiConsumer<String, String>() {
+                            @Override
+                            public void accept(String key, String value) {
+                                attributes.merge(key, value, new BiFunction<String, String, String>() {
+                                    @Override
+                                    public String apply(String v1, String v2) {
+                                        return v1;
+                                    }
+                                });
+                            }
+                        }
+                );
+            }
+            
             return attributes;
         } catch (UserStoreException e) {
             throw new UserStoreException("Error in filtering users by multi attributes ", e);
@@ -1408,7 +1430,7 @@ public class SCIMUserManager implements UserManager {
 
         try {
             if (StringUtils.isEmpty(domainName)) {
-                domainName = "PRIMARY";
+                domainName = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
             }
             Map<String, String> attributes = getAllAttributes(domainName);
             if (log.isDebugEnabled()) {
@@ -1416,10 +1438,26 @@ public class SCIMUserManager implements UserManager {
             }
             userNames = ((PaginatedUserStoreManager) carbonUM).getUserList(getCondition(node, attributes), domainName,
                     UserCoreConstants.DEFAULT_PROFILE, limit, offset, sortBy, sortOrder);
-            return userNames;
+
+            return prefixWithDomain(userNames,domainName);
+
         } catch (UserStoreException e) {
             throw new CharonException("Error in filtering users by multi attributes ", e);
         }
+    }
+
+    /**
+     * Prefix the usernames with the domain name
+     * @param userNames
+     * @param domainName
+     * @return
+     */
+    private String[] prefixWithDomain( String[] userNames,String domainName){
+        String[] userNamesWithDomain = new String[userNames.length];
+        for(int i=0 ; i<userNames.length ; i++) {
+            userNamesWithDomain[i] = domainName + CarbonConstants.DOMAIN_SEPARATOR + userNames[i];
+        }
+        return userNamesWithDomain;
     }
 
     /**
@@ -1893,9 +1931,16 @@ public class SCIMUserManager implements UserManager {
             // If the domain is specified create a attribute value with the domain name.
             String searchValue = domainName + CarbonConstants.DOMAIN_SEPARATOR + SCIMCommonConstants.ANY;
 
-            // Retrieve roles using the above attribute value.
-            List<String> roleList = Arrays.asList(((AbstractUserStoreManager) carbonUM)
-                    .getRoleNames(searchValue, MAX_ITEM_LIMIT_UNLIMITED, true, true, true));
+            List<String> roleList;
+            // Retrieve roles using the above search value.
+            if (isInternalOrApplicationGroup(domainName)) {
+                // Support for hybrid roles listing with domain parameter. ex: domain=Application.
+                roleList = Arrays.asList(filterHybridRoles(domainName, searchValue));
+            } else {
+                // Retrieve roles using the above attribute value.
+                roleList = Arrays.asList(((AbstractUserStoreManager) carbonUM)
+                        .getRoleNames(searchValue, MAX_ITEM_LIMIT_UNLIMITED, true, true, true));
+            }
             Set<String> roleNames = new HashSet<>(roleList);
             return roleNames;
         }
@@ -2079,7 +2124,12 @@ public class SCIMUserManager implements UserManager {
                 if (log.isDebugEnabled()) {
                     log.debug(String.format("Attribute value: %s is embedded with a domain.", attributeValue));
                 }
-                extractedDomain = contentInAttributeValue[0].toUpperCase();
+                String domainInAttributeValue = contentInAttributeValue[0];
+                if (isInternalOrApplicationGroup(domainInAttributeValue)) {
+                    extractedDomain = domainInAttributeValue;
+                } else {
+                    extractedDomain = domainInAttributeValue.toUpperCase();
+                }
 
                 // Check whether the domain name is equal to the extracted domain name from attribute value.
                 if (StringUtils.isNotEmpty(domainName) && StringUtils.isNotEmpty(extractedDomain) && !extractedDomain
@@ -2368,6 +2418,16 @@ public class SCIMUserManager implements UserManager {
             // Add username with domain name
             attributes.put(SCIMConstants.UserSchemaConstants.USER_NAME_URI, userName);
 
+            // Location URI is not available for users who created from the mgt console also location URI is not
+            // tenant aware, so need to update the location URI according to the tenant.
+            String locationURI = SCIMCommonUtils
+                    .getSCIMUserURL(attributes.get(SCIMConstants.CommonSchemaConstants.ID_URI));
+            attributes.put(SCIMConstants.CommonSchemaConstants.LOCATION_URI, locationURI);
+
+            if (!attributes.containsKey(SCIMConstants.CommonSchemaConstants.RESOURCE_TYPE_URI)) {
+                attributes.put(SCIMConstants.CommonSchemaConstants.RESOURCE_TYPE_URI, SCIMConstants.USER);
+            }
+
             //get groups of user and add it as groups attribute
             String[] roles = carbonUM.getRoleListOfUser(userName);
             // Add username with domain name
@@ -2403,7 +2463,7 @@ public class SCIMUserManager implements UserManager {
                 }
 
                 if (group != null) { // can be null for non SCIM groups
-                    scimUser.setGroup(null, group.getId(), role);
+                    scimUser.setGroup(null, group);
                 }
             }
         } catch (UserStoreException | CharonException | NotFoundException | IdentitySCIMException |BadRequestException e) {
@@ -2599,7 +2659,12 @@ public class SCIMUserManager implements UserManager {
                 if (mandateDomainForUsernamesAndGroupNamesInResponse()) {
                     userName = prependDomain(userName);
                 }
-                group.setMember(userId, userName);
+                String locationURI = SCIMCommonUtils.getSCIMUserURL(userId);
+                User user = new User();
+                user.setUserName(userName);
+                user.setId(userId);
+                user.setLocation(locationURI);
+                group.setMember(user);
             }
         }
         //get other group attributes and set.
@@ -2925,8 +2990,18 @@ public class SCIMUserManager implements UserManager {
         if (log.isDebugEnabled()) {
             log.debug(String.format("Filtering roleNames from search attribute: %s", searchAttribute));
         }
-        return ((AbstractUserStoreManager) carbonUM)
-                .getRoleNames(searchAttribute, MAX_ITEM_LIMIT_UNLIMITED, true, true, true);
+        String domain = SCIMCommonUtils.extractDomain(attributeValue);
+        // Extract domain from attribute value.
+        if (isInternalOrApplicationGroup(domain)) {
+            return filterHybridRoles(domain, searchAttribute);
+        } else if (StringUtils.isEmpty(domain)) {
+            // When domain is empty filter through all the domains.
+            return ((AbstractUserStoreManager) carbonUM)
+                    .getRoleNames(searchAttribute, MAX_ITEM_LIMIT_UNLIMITED, false, true, true);
+        } else {
+            return ((AbstractUserStoreManager) carbonUM)
+                    .getRoleNames(searchAttribute, MAX_ITEM_LIMIT_UNLIMITED, true, true, true);
+        }
     }
 
     /**
@@ -3099,5 +3174,76 @@ public class SCIMUserManager implements UserManager {
             requiredClaimsInLocalDialect = new ArrayList<>();
         }
         return requiredClaimsInLocalDialect;
+    }
+
+    /**
+     * Evaluate old user claims and the new claims. Then DELETE, ADD and MODIFY user claim values. The DELETE,
+     * ADD and MODIFY operations are done in the same order.
+     *
+     * @param user {@link User} object.
+     * @param oldClaimList User claim list for the user's existing state.
+     * @param newClaimList User claim list for the user's new state.
+     * @throws UserStoreException Error while accessing the user store.
+     * @throws CharonException {@link CharonException}.
+     */
+    private void updateUserClaims(User user, Map<String, String> oldClaimList,
+                                  Map<String, String> newClaimList) throws UserStoreException, CharonException {
+
+        Map<String, String> userClaimsToBeAdded = new HashMap<>(newClaimList);
+        Map<String, String> userClaimsToBeDeleted = new HashMap<>(oldClaimList);
+        Map<String, String> userClaimsToBeModified = new HashMap<>();
+
+        // Get all the old claims, which are not available in the new claims.
+        userClaimsToBeDeleted.keySet().removeAll(newClaimList.keySet());
+
+        // Get all the new claims, which are not available in the existing claims.
+        userClaimsToBeAdded.keySet().removeAll(oldClaimList.keySet());
+
+        // Get all new claims, which are only modifying the value of an existing claim.
+        for (Map.Entry<String, String> eachNewClaim : newClaimList.entrySet()) {
+            if (oldClaimList.containsKey(eachNewClaim.getKey()) &&
+                    !oldClaimList.get(eachNewClaim.getKey()).equals(eachNewClaim.getValue())) {
+                userClaimsToBeModified.put(eachNewClaim.getKey(), eachNewClaim.getValue());
+            }
+        }
+
+        // Remove user claims.
+        for (Map.Entry<String, String> entry : userClaimsToBeDeleted.entrySet()) {
+            if (!isImmutableClaim(entry.getKey())) {
+                carbonUM.deleteUserClaimValue(user.getUserName(), entry.getKey(), null);
+            }
+        }
+
+        // Update user claims.
+        userClaimsToBeModified.putAll(userClaimsToBeAdded);
+        carbonUM.setUserClaimValues(user.getUserName(), userClaimsToBeModified, null);
+    }
+
+    /**
+     * Method to filter hybrid roles (Application & Internal) from a search value.
+     *
+     * @param domainInAttributeValue domain of the hybrid role
+     * @param searchAttribute        search value
+     * @return Array of filtered hybrid roles.
+     * @throws org.wso2.carbon.user.core.UserStoreException
+     */
+    private String[] filterHybridRoles(String domainInAttributeValue, String searchAttribute)
+            throws org.wso2.carbon.user.core.UserStoreException {
+
+        List<String> roleList = new ArrayList<>();
+        // Get filtered hybrid roles by passing noInternalRoles=false.
+        String[] hybridRoles = ((AbstractUserStoreManager) carbonUM)
+                .getRoleNames(searchAttribute, MAX_ITEM_LIMIT_UNLIMITED, false, true, true);
+        // Iterate through received hybrid roles and filter out specific hybrid role domain(Application or Internal) values
+        for (String hybridRole : hybridRoles) {
+            if (domainInAttributeValue != null && !hybridRole.startsWith(domainInAttributeValue)) {
+                continue;
+            }
+            if (hybridRole.toLowerCase().startsWith(SCIMCommonConstants.INTERNAL_DOMAIN.toLowerCase()) || hybridRole
+                    .toLowerCase().startsWith(SCIMCommonConstants.APPLICATION_DOMAIN.toLowerCase())) {
+                roleList.add(hybridRole);
+            }
+        }
+        return roleList.toArray(new String[roleList.size()]);
     }
 }
