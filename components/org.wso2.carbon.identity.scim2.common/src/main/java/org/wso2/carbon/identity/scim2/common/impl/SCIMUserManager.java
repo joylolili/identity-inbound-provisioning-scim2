@@ -2876,7 +2876,7 @@ public class SCIMUserManager implements UserManager {
 
         // For attributes which support domain embedding, create search value by appending the delimiter after
         // the domain separator.
-        if (isDomainSupportedAttribute(attributeName)) {
+        if (isDomainSupportedAttribute(attributeName) || attributeValue.contains(CarbonConstants.DOMAIN_SEPARATOR)) {
 
             // Check whether domain is embedded in the attribute value.
             String[] attributeItems = attributeValue.split(CarbonConstants.DOMAIN_SEPARATOR, 2);
@@ -2905,7 +2905,7 @@ public class SCIMUserManager implements UserManager {
 
         // For attributes which support domain embedding, create search value by appending the delimiter after
         // the domain separator.
-        if (isDomainSupportedAttribute(attributeName)) {
+        if (isDomainSupportedAttribute(attributeName) || attributeValue.contains(CarbonConstants.DOMAIN_SEPARATOR)) {
             // Extract the domain attached to the attribute value and then append the delimiter.
             String[] attributeItems = attributeValue.split(CarbonConstants.DOMAIN_SEPARATOR, 2);
             if (attributeItems.length > 1) {
